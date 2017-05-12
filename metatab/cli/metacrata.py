@@ -104,10 +104,8 @@ def metacrata():
                     publish_to_socrata(m.update_mt_arg(url))
                 except Exception as e:
                     warn("Failed to process {}: {}".format(line, e))
-
     else:
         publish_to_socrata(m)
-
     exit(0)
 
 def publish_to_socrata(m):
@@ -121,23 +119,24 @@ def publish_to_socrata(m):
     # Get all datafile resources:
     # If there are no resources:
     if len(doc.find("root.datafile")) == 0:
-        create_empty_dataset(doc)
+        create_empty_dataset(doc, client)
     # Otherwise Process Resources
     else:
-        create_socrata_resources(doc)
+        create_socrata_resources(doc, client)
 
-def create_empty_dataset(doc):
+def create_empty_dataset(doc, client):
     new_dataset = dict()
     title = doc.find_first_value('Root.Title')
     new_dataset.update({"name":title})
     description = doc.find_first_value('Root.Description')
     new_dataset.update({"description":description})
+    # TODO: create the socrata dataset
     return
 
-def create_socrata_resources(doc):
+def create_socrata_resources(doc, client):
     new_datasets_raw = doc.find("root.datafile")
     new_datasets = []
-    for dataset in new_datasets:
+    for dataset in new_datasets_raw:
         new_dataset = dict()
         # Dataset creation requires:
         # title
@@ -157,7 +156,7 @@ def create_socrata_resources(doc):
         columns = get_columns(doc, dataset.get_value("schema"))
         new_dataset.update({"columns":columns})
         new_datasets.append(new_dataset)
-    publish(new_datasets)
+    publish(new_datasets, client)
     return
 
 def get_columns(doc, schema):
@@ -166,7 +165,7 @@ def get_columns(doc, schema):
     for meta_schema in doc.get_section("schema"):
         if schema == meta_schema.value:
             table = meta_schema.term
-    column_metadata_raw = doc.find("table.column")
+    column_metadata_raw = doc.find(table+".column")
     column_metadata = []
     for column in column_metadata_raw:
         new_column = dict()
@@ -182,7 +181,6 @@ def get_columns(doc, schema):
 def map_type(datatype):
     '''
     Map the metatab datatypes to Socrata types
-    Maybe we may just want to force Socrata datatypes though...
     '''
     if(datatype == "str"):
         return "text"
@@ -190,8 +188,19 @@ def map_type(datatype):
         return "number"
     elif(datatype == "bool"):
         return "text"
+    else:
+        return "text"
 
-def publish(new_datasets):
+def publish(new_datasets, client):
     # 2. Create a Dataset w/ metadata
+    for new_dataset in new_datasets:
+        client.create(
+            new_dataset['name'],
+            description=new_dataset['description'],
+            columns=new_dataset['columns'],
+            tags=new_dataset['tags'],
+            category=new_dataset['category']
+            )
 
-def add_metadata
+def add_metadata():
+    return
