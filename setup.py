@@ -85,7 +85,8 @@ setup(
         'rowgenerators>=0.1.8',
         'rowpipe>=0.1.2',
         'tableintuit>=0.0.6',
-        'geoid>=1.0.4'
+        'geoid>=1.0.4',
+        'sodapy>=1.4.3'
 
     ],
 
