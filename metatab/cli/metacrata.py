@@ -201,6 +201,7 @@ def publish(new_datasets, client):
             tags=new_dataset['tags'],
             category=new_dataset['category']
             )
+    return
 
 def add_metadata():
     return
