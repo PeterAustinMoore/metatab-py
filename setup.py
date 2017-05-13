@@ -95,6 +95,7 @@ setup(
         'console_scripts': [
             'metatab=metatab.cli.metatab:metatab',
             'metapack=metatab.cli.metapack:metapack',
+            'metacrata=metatab.cli.metacrata:metacrata',
             'metakan=metatab.cli.metakan:metakan',
             'metasync=metatab.cli.metasync:metasync',
             'metaworld=metatab.cli.metaworld:metaworld',

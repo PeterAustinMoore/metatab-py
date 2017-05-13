@@ -159,7 +159,3 @@ def send_to_dw(doc):
         ds = client.create_dataset('ericbusboom', **d)
 
         ds = client.get_dataset(key)
-
-
-
-
