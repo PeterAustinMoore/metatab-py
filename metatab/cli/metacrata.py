@@ -36,7 +36,7 @@ def metacrata():
     parser.add_argument('-p', '--password', help="Socrata password")
 
     parser.add_argument('metatabfile', nargs='?', default=DEFAULT_METATAB_FILE,
-                        help='Path to a Metatab file, or an s3 link to a bucket with Metatab files. ')
+                        help='Path to a Metatab file. ')
 
     class MetapackCliMemo(object):
         def __init__(self, args):
@@ -52,21 +52,21 @@ def metacrata():
             if not self.mt_file:
                 err("Metatab file required")
 
-            self.app_token = self.args.api or getenv('SOCRATA_APP_TOKEN')
+            self.app_token = self.args.api or getenv('SODA_APP_TOKEN')
             if not self.app_token:
-                err("Set the --api option SOCRATA_API_KEY env var with the API key to a Socrata instance")
+                err("Set the -a/--api option SODA_APP_TOKEN env var with the API key to a Socrata instance")
 
             self.socrata_url = self.args.socrata or getenv('SOCRATA_URL')
             if not self.socrata_url:
-                err("Set the --socrata option or the SOCRATA_URL env var to set the URL of a Socrata instance")
+                err("Set the -s/--socrata option or the SOCRATA_URL env var to set the URL of a Socrata instance")
 
-            self.username = self.args.username
+            self.username = self.args.username or getenv("SODA_USERNAME")
             if not self.username:
-                err("Set the -u/--username option")
+                err("Set the -u/--username option or SODA_USERNAME environmental variable")
 
-            self.password = self.args.password
+            self.password = self.args.password or getenv("SODA_PASSWORD")
             if not self.password:
-                err("Set the -p/--password option")
+                err("Set the -p/--password option or SODA_PASSWORD environmental variable")
 
         def update_mt_arg(self, metatabfile):
             """Return a new memo with a new metatabfile argument"""
@@ -78,6 +78,7 @@ def metacrata():
     exit(0)
 
 def publish_to_socrata(m):
+    # Initialize Socrata client from sodapy
     from sodapy import Socrata
     client = Socrata(m.socrata_url, m.app_token, username=m.username, password=m.password)
     # 1. Get Metadata from Metatab
@@ -89,7 +90,10 @@ def publish_to_socrata(m):
     # If there are no resources:
     if len(doc.find("root.datafile")) == 0:
         create_parent_dataset(doc, client)
-    # Otherwise Process Resources
+    # If there is one resource, create a single dataset
+    elif len(doc.find("root.datafile")) == 1:
+        create_socrata_resources(doc, client)
+    # If there are multiple, create the parent-child structure
     else:
         children = create_socrata_resources(doc, client)
         create_parent_dataset(doc, client, children=children)
@@ -104,19 +108,23 @@ def create_parent_dataset(doc, client, children=None):
     # Dataset Information
     title = doc.find_first_value('Root.Title')
     prt("Creating package parent: {}".format(title))
+    # Description
     description = doc.find_first_value('Root.Description')
-    organization = doc.find_first_value("root.creator")
+    # Default Fields
+    displayType = "href"
+    displayFormat = {}
+    query = {}
+    # Tags
+    tags = doc.find_first_value('Root.Tags').split(",")
+    # Category
+    category = doc.find_first_value('Root.Category')
+
     # Metadata Fields
     metadata = {"renderTypeConfig": {"visible":{"href":"true"}},
                 "accessPoints":{"URL":"http://"+doc.find_first_value("Root.Name").replace("-","/")},
                 "availableDisplayTypes":["href"],
                 "jsonQuery":{}
                 }
-    displayType = "href"
-    displayFormat = {}
-    query = {}
-    columns = [{"name":"test","dataTypeName":"text"}]
-
     # Data Dictionary
     if doc.find_first_value("root.documentation"):
         metadata['additionalAccessPoints'] = [{
@@ -133,10 +141,17 @@ def create_parent_dataset(doc, client, children=None):
                 "title":child['title'],
                 }
             metadata['additionalAccessPoints'].append(new_child)
+
+    # Data.json Project Open Data Metadata v1
+    metadata = project_open_data(doc, metadata)
+
+    # Create the parent
     dataset_id = client.create(
         title,
         description=description,
         metadata=metadata,
+        tags=tags,
+        category=category,
         displayType=displayType,
         displayFormat=displayFormat,
         attribution=organization,
@@ -167,23 +182,62 @@ def create_socrata_resources(doc, client, parent=None):
         description = doc.find_first_value('Root.Description')
         new_dataset.update({"description":description})
         # Tags
-        tags = ["t"]
+        tags = doc.find_first_value('Root.Tags').split(",")
         new_dataset.update({"tags":tags})
         # Category
-        category = "category"
+        category = doc.find_first_value('Root.Category')
         new_dataset.update({"category":category})
         # Columns
         columns = get_columns(doc, dataset.get_value("schema"))
         new_dataset.update({"columns":columns})
-        # Source Link
-        source = dataset.get_value("url")
-        new_dataset.update({"attributionLink":source})
-        # Source Organization
-        organization = doc.find_first_value("root.creator")
-        new_dataset.update({"attribution":organization})
+        #
+        attributionLink = dataset.get_value("url")
+        new_dataset.update({"attributionLink":attributionLink})
+        # Common Core Metadata
+        metadata = {}
+        metadata = project_open_data(doc, metadata)
+        new_dataset.update({"metadata":metadata})
+
         new_datasets.append(new_dataset)
     children = publish(new_datasets, client)
     return children
+
+def project_open_data(doc, metadata):
+    '''
+    Map the project open data v1.1 metadata guide:
+    https://project-open-data.cio.gov/v1.1/schema/
+    @return: metadata dictionary
+    '''
+    metadata_fields = ["Publisher",
+        "Contact Name",
+        "Contact Email",
+        "Bureau Code",
+        "Program Code",
+        "Public Access Level",
+        "Access Level Comment",
+        "Geographic Coverage",
+        "Temporal Applicability",
+        "Theme",
+        "Described By",
+        "Described By Type",
+        "Is Quality Data",
+        "Update Frequency",
+        "Language",
+        "Primary It Investment Uii",
+        "System of Records",
+        "Homepage",
+        "Issued",
+        "References",
+        "License"]
+
+    metadata.update({'custom_fields':{"Common Core":{}}})
+    # Check that fields are data.json compliant
+    for field in doc.get_section("common_core"):
+        if field.term.title() in metadata_fields:
+            if field.value:
+                metadata['custom_fields']['Common Core'].update({field.term.title():field.value})
+    return metadata
+
 
 def get_columns(doc, schema):
     # Get the right table name
@@ -195,18 +249,26 @@ def get_columns(doc, schema):
     column_metadata = []
     for column in column_metadata_raw:
         new_column = dict()
+        # Column Name
         name = column.value
         new_column.update({"name":name})
+        # Datatype mapped from Metatab standards
+        # to Socrata datatypes
         dataTypeName = map_type(column.get_value("datatype"))
         new_column.update({"dataTypeName":dataTypeName})
-        description = column.get_value("description")
+        # Description (if there is one)
+        description = "" if len(column.get_value("valuetype")) == 0 else column.get_value("valuetype") + " - "
+        description += column.get_value("description") if column.get_value("description") else ""
         new_column.update({"description":description})
+
         column_metadata.append(new_column)
     return column_metadata
 
 def map_type(datatype):
     '''
     Map the metatab datatypes to Socrata types
+    @default: text
+    @return: Socrata datatype
     '''
     if(datatype == "str"):
         return "text"
@@ -231,8 +293,7 @@ def publish(new_datasets, client):
             columns=new_dataset['columns'],
             tags=new_dataset['tags'],
             category=new_dataset['category'],
-            attribution=new_dataset['attribution'],
-            attributionLink=new_dataset['attributionLink']
+            metadata=new_dataset['metadata']
             )
         child = dict(
             api="https://{}/resource/{}.json".format(client.domain, dataset_id['id']),
