@@ -9,6 +9,9 @@ import mimetypes
 import sys
 from os import getenv, getcwd
 from os.path import join, basename
+from copy import deepcopy
+import re
+import requests
 
 from metatab import _meta, DEFAULT_METATAB_FILE, resolve_package_metadata_url, MetatabDoc, open_package, MetatabError
 from metatab.cli.core import err, metatab_info
@@ -34,6 +37,8 @@ def metacrata():
     parser.add_argument('-u', '--username', help="Socrata username")
 
     parser.add_argument('-p', '--password', help="Socrata password")
+
+    parser.add_argument('--sync', help="Sync defined metatab file to package ID")
 
     parser.add_argument('metatabfile', nargs='?', default=DEFAULT_METATAB_FILE,
                         help='Path to a Metatab file. ')
@@ -68,6 +73,8 @@ def metacrata():
             if not self.password:
                 err("Set the -p/--password option or SODA_PASSWORD environmental variable")
 
+            self.ssync = self.args.sync
+
         def update_mt_arg(self, metatabfile):
             """Return a new memo with a new metatabfile argument"""
             o = MetapackCliMemo(self.args)
@@ -86,39 +93,74 @@ def publish_to_socrata(m):
         doc = MetatabDoc(m.mt_file)
     except (IOError, MetatabError) as e:
         err("Failed to open metatab '{}': {}".format(m.mt_file, e))
+
+    # Catch the bad dataset IDs
+    if m.ssync:
+        valid, message = validate_four_by_bour(m.ssync, client)
+        if not valid:
+            err(message)
+
     # Get all datafile resources:
     # If there are no resources:
     if len(doc.find("root.datafile")) == 0:
-        create_parent_dataset(doc, client)
+        if m.ssync:
+            create_or_update_parent(doc, client, update=True, dataset=m.ssync)
+        else:
+            create_or_update_parent(doc, client)
     # If there is one resource, create a single dataset
     elif len(doc.find("root.datafile")) == 1:
-        create_socrata_resources(doc, client)
+        if m.ssync:
+            create_or_update_resources(doc, client, update=True, dataset=m.ssync)
+        else:
+            create_or_update_resources(doc, client)
     # If there are multiple, create the parent-child structure
     else:
-        children = create_socrata_resources(doc, client)
-        create_parent_dataset(doc, client, children=children)
+        if m.ssync:
+            create_or_update_resources(doc, client, update=True, dataset=m.ssync)
+            create_or_update_parent(doc, client, update=True, dataset=m.ssync)
+        else:
+            children = create_socrata_resources(doc, client)
+            create_parent_dataset(doc, client, children=children)
+
+def validate_four_by_bour(dataset_id, client):
+    r = re.compile('^[a-z0-9]{4}-[a-z0-9]{4}$')
+    if r.match(dataset_id):
+        try:
+            # Let Sodapy catch the 4x4s that aren't real datasets
+            client.get(dataset_id)
+        except requests.exceptions.HTTPError:
+            message = "Dataset does not exist"
+            return False, message
+    else:
+        message = "Dataset ID: {} not valid".format(dataset_id)
+        return False, message
+    return True
 
 
-def create_parent_dataset(doc, client, children=None):
+def create_or_update_parent(doc, client, children=None, update=False, dataset=None):
     '''
     Creates the parent dataset to which child datasets
     can be attributed and linked, while retaining the independence
     of the child datasets as separate assets
     '''
+    new_parent = {}
     # Dataset Information
     title = doc.find_first_value('Root.Title')
     prt("Creating package parent: {}".format(title))
+    new_parent.update({"title":title})
     # Description
     description = doc.find_first_value('Root.Description')
+    new_parent.update({"description":description})
     # Default Fields
     displayType = "href"
     displayFormat = {}
     query = {}
     # Tags
     tags = doc.find_first_value('Root.Tags').split(",")
+    new_parent.update({"tags":tags})
     # Category
     category = doc.find_first_value('Root.Category')
-
+    new_parent.update({"category":category})
     # Metadata Fields
     metadata = {"renderTypeConfig": {"visible":{"href":"true"}},
                 "accessPoints":{"URL":"http://"+doc.find_first_value("Root.Name").replace("-","/")},
@@ -144,63 +186,87 @@ def create_parent_dataset(doc, client, children=None):
 
     # Data.json Project Open Data Metadata v1
     metadata = project_open_data(doc, metadata)
+    new_parent.update({"metadata":metadata})
 
-    # Create the parent
-    dataset_id = client.create(
-        title,
-        description=description,
-        metadata=metadata,
-        tags=tags,
-        category=category,
-        displayType=displayType,
-        displayFormat=displayFormat,
-        attribution=organization,
-        query=query
-        )
-    parent_dataset = "https://{0}/d/{1}".format(client.domain,dataset_id['id'])
-    prt("Parent dataset {} created at {}".format(title,parent_dataset))
-    return parent_dataset
+    if update:
+        # Update the parent
+        dataset_id = sync(new_parent, dataset, client)
+        parent_dataset = "https://{0}/d/{1}".format(client.domain,dataset_id['id'])
+        prt("Parent dataset {} updated at {}".format(title,parent_dataset))
+        return parent_dataset
+    else:
+        # Create the parent
+        dataset_id = client.create(
+            title,
+            description=description,
+            metadata=metadata,
+            tags=tags,
+            category=category,
+            displayType=displayType,
+            displayFormat=displayFormat,
+            attribution=organization,
+            query=query
+            )
+        parent_dataset = "https://{0}/d/{1}".format(client.domain,dataset_id['id'])
+        prt("Parent dataset {} created at {}".format(title,parent_dataset))
+        return parent_dataset
 
-def create_socrata_resources(doc, client, parent=None):
+def create_or_update_resources(doc, client, parent=None, update=False, dataset=None):
     '''
     Creates separate Socrata assets with columnar schema and parent
     metadata
-    @return: a dictionary of child url and titles
+    @return: a dictionary of created child url and titles or number
+            of datasets updated.
     '''
-    new_datasets_raw = doc.find("root.datafile")
-    prt("Creating {} new datasets".format(len(new_datasets_raw)))
-    new_datasets = []
-    for dataset in new_datasets_raw:
-        new_dataset = dict()
-        # Dataset creation requires:
-        # title
-        # Title of the Dataset
-        title = dataset.get_value("title")
-        prt("Gathering metadata for {}".format(title))
-        new_dataset.update({"name":title})
-        # Description
-        description = doc.find_first_value('Root.Description')
-        new_dataset.update({"description":description})
-        # Tags
-        tags = doc.find_first_value('Root.Tags').split(",")
-        new_dataset.update({"tags":tags})
-        # Category
-        category = doc.find_first_value('Root.Category')
-        new_dataset.update({"category":category})
-        # Columns
-        columns = get_columns(doc, dataset.get_value("schema"))
-        new_dataset.update({"columns":columns})
-        #
-        attributionLink = dataset.get_value("url")
-        new_dataset.update({"attributionLink":attributionLink})
-        # Common Core Metadata
-        metadata = {}
-        metadata = project_open_data(doc, metadata)
-        new_dataset.update({"metadata":metadata})
+    # Update the resource
+    if update:
+        datasets_raw = doc.find("root.datafile")
+        prt("Updating {} new datasets".format(len(datasets_raw)))
+        updated_datasets = 0
+        for dataset in datasets_raw:
+            new_dataset = get_metadata(doc, dataset)
+            updated_datasets += sync(new_datasets, dataset, client)
+        prt("{} datasets updated".format(updated_datasets))
+        return updated_datasets
+    # Create the resource
+    else:
+        datasets_raw = doc.find("root.datafile")
+        prt("Creating {} new datasets".format(len(datasets_raw)))
+        new_datasets = []
+        for dataset in datasets_raw:
+            new_dataset = get_metadata(doc, dataset)
+            new_datasets.append(new_dataset)
+        children = publish(new_datasets, client)
+        return children
 
-        new_datasets.append(new_dataset)
-    children = publish(new_datasets, client)
-    return children
+def get_metadata(doc, dataset):
+    new_dataset = dict()
+    # Dataset creation requires:
+    # title
+    # Title of the Dataset
+    title = dataset.get_value("title")
+    prt("Gathering metadata for {}".format(title))
+    new_dataset.update({"name":title})
+    # Description
+    description = doc.find_first_value('Root.Description')
+    new_dataset.update({"description":description})
+    # Tags
+    tags = doc.find_first_value('Root.Tags').split(",")
+    new_dataset.update({"tags":tags})
+    # Category
+    category = doc.find_first_value('Root.Category')
+    new_dataset.update({"category":category})
+    # Columns
+    columns = get_columns(doc, dataset.get_value("schema"))
+    new_dataset.update({"columns":columns})
+    #
+    attributionLink = dataset.get_value("url")
+    new_dataset.update({"attributionLink":attributionLink})
+    # Common Core Metadata
+    metadata = {}
+    metadata = project_open_data(doc, metadata)
+    new_dataset.update({"metadata":metadata})
+    return new_dataset
 
 def project_open_data(doc, metadata):
     '''
@@ -304,3 +370,14 @@ def publish(new_datasets, client):
         prt("{} published to {}".format(child['title'],child['source']))
         children.append(child)
     return children
+
+def sync(new_metadata, dataset_id, client):
+    metadata_raw = client.get_metadata(dataset_id)
+    metadata = deepcopy(metadata_raw)
+    diff_metadata = diff(metadata, new_metadata)
+    prt(diff_metadata)
+    response = client.update_metadata(diff_metadata)
+    return response
+
+def diff(old, new):
+    return({k:v for k,v in new.items() if k not in old or v != old[k]})
